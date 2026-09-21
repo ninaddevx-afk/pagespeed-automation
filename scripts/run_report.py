@@ -17,7 +17,9 @@ Required environment variables:
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -32,8 +34,19 @@ CLICKUP_API_TOKEN = os.environ["CLICKUP_API_TOKEN"]
 CLICKUP_TASK_ID = os.environ["CLICKUP_TASK_ID"]
 POWER_AUTOMATE_WEBHOOK_URL = os.environ["POWER_AUTOMATE_WEBHOOK_URL"]
 
+# How many PageSpeed calls to run at once. PageSpeed's own quota comfortably
+# allows this; raise cautiously if you want it faster still.
+MAX_WORKERS = 5
+
 # Adjust to your local timezone for the date shown in the report/comment.
 IST = timezone(timedelta(hours=5, minutes=30))
+
+_print_lock = threading.Lock()
+
+
+def safe_print(msg):
+    with _print_lock:
+        print(msg)
 
 
 def load_urls():
@@ -70,22 +83,72 @@ def fetch_pagespeed(url, strategy, attempts=3):
             }
         except Exception as exc:  # noqa: BLE001 - want to retry on any failure
             last_error = exc
-            print(f"  [warn] {strategy} attempt {attempt} failed for {url}: {exc}")
+            safe_print(f"  [warn] {strategy} attempt {attempt} failed for {url}: {exc}")
             if attempt < attempts:
                 time.sleep(5 * attempt)
     raise RuntimeError(f"PageSpeed failed for {url} ({strategy}): {last_error}")
 
 
+# None marks a metric that failed after all retries. Formatted per
+# destination: -1 (a value that can't occur naturally) for Excel's numeric
+# columns, "ERR" for the human-readable image.
+ERROR_METRICS = {"score": None, "fcp": None, "lcp": None, "tbt": None, "cls": None, "si": None}
+
+
+def for_excel(v):
+    return -1 if v is None else v
+
+
+def for_display(v):
+    return "ERR" if v is None else v
+
+
 def build_rows(urls, date_str):
-    rows = []
-    for i, url in enumerate(urls, start=1):
-        print(f"[{i}/{len(urls)}] {url}")
-        mobile = fetch_pagespeed(url, "mobile")
-        time.sleep(1)
-        desktop = fetch_pagespeed(url, "desktop")
-        time.sleep(1)
-        rows.append({"date": date_str, "url": url, "mobile": mobile, "desktop": desktop})
-    return rows
+    # Fire mobile+desktop for every URL as concurrent tasks (bounded by
+    # MAX_WORKERS). Each individual call still goes through fetch_pagespeed's
+    # own retry/backoff logic (the failsafe) - concurrency only affects how
+    # many of those retry-protected calls are in flight at once.
+    #
+    # A URL that still fails after all retries no longer aborts the whole
+    # run - it's recorded as an "ERR" row so the other ~49 successful calls
+    # (and the Excel write / image / ClickUp post) aren't thrown away over
+    # one flaky PageSpeed request.
+    tasks = [(url, strategy) for url in urls for strategy in ("mobile", "desktop")]
+    results = {}
+    completed = 0
+    failed_tasks = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_task = {
+            executor.submit(fetch_pagespeed, url, strategy): (url, strategy)
+            for url, strategy in tasks
+        }
+        for future in as_completed(future_to_task):
+            url, strategy = future_to_task[future]
+            try:
+                results[(url, strategy)] = future.result()
+            except Exception as exc:  # noqa: BLE001 - degrade, don't abort the run
+                safe_print(f"  [error] giving up on {strategy} for {url}: {exc}")
+                results[(url, strategy)] = ERROR_METRICS
+                failed_tasks.append((url, strategy))
+            completed += 1
+            safe_print(f"[{completed}/{len(tasks)}] done: {strategy} - {url}")
+
+    if failed_tasks:
+        safe_print(f"WARNING: {len(failed_tasks)} call(s) failed after retries and are marked ERR:")
+        for url, strategy in failed_tasks:
+            safe_print(f"  - {strategy}: {url}")
+
+    rows = [
+        {
+            "date": date_str,
+            "url": url,
+            "mobile": results[(url, "mobile")],
+            "desktop": results[(url, "desktop")],
+        }
+        for url in urls
+    ]
+    return rows, failed_tasks
 
 
 def push_to_excel(rows, date_str):
@@ -94,18 +157,18 @@ def push_to_excel(rows, date_str):
             {
                 "date": date_str,
                 "url": r["url"],
-                "m_score": r["mobile"]["score"],
-                "m_fcp": r["mobile"]["fcp"],
-                "m_lcp": r["mobile"]["lcp"],
-                "m_tbt": r["mobile"]["tbt"],
-                "m_cls": r["mobile"]["cls"],
-                "m_si": r["mobile"]["si"],
-                "d_score": r["desktop"]["score"],
-                "d_fcp": r["desktop"]["fcp"],
-                "d_lcp": r["desktop"]["lcp"],
-                "d_tbt": r["desktop"]["tbt"],
-                "d_cls": r["desktop"]["cls"],
-                "d_si": r["desktop"]["si"],
+                "m_score": for_excel(r["mobile"]["score"]),
+                "m_fcp": for_excel(r["mobile"]["fcp"]),
+                "m_lcp": for_excel(r["mobile"]["lcp"]),
+                "m_tbt": for_excel(r["mobile"]["tbt"]),
+                "m_cls": for_excel(r["mobile"]["cls"]),
+                "m_si": for_excel(r["mobile"]["si"]),
+                "d_score": for_excel(r["desktop"]["score"]),
+                "d_fcp": for_excel(r["desktop"]["fcp"]),
+                "d_lcp": for_excel(r["desktop"]["lcp"]),
+                "d_tbt": for_excel(r["desktop"]["tbt"]),
+                "d_cls": for_excel(r["desktop"]["cls"]),
+                "d_si": for_excel(r["desktop"]["si"]),
             }
             for r in rows
         ]
@@ -122,10 +185,10 @@ def render_html(rows, date_str):
         <tr>
           <td>{r['date']}</td>
           <td class="url"><a href="{r['url']}">{r['url']}</a></td>
-          <td>{m['score']}</td><td>{m['fcp']}</td><td>{m['lcp']}</td>
-          <td>{m['tbt']}</td><td>{m['cls']}</td><td>{m['si']}</td>
-          <td>{d['score']}</td><td>{d['fcp']}</td><td>{d['lcp']}</td>
-          <td>{d['tbt']}</td><td>{d['cls']}</td><td>{d['si']}</td>
+          <td>{for_display(m['score'])}</td><td>{for_display(m['fcp'])}</td><td>{for_display(m['lcp'])}</td>
+          <td>{for_display(m['tbt'])}</td><td>{for_display(m['cls'])}</td><td>{for_display(m['si'])}</td>
+          <td>{for_display(d['score'])}</td><td>{for_display(d['fcp'])}</td><td>{for_display(d['lcp'])}</td>
+          <td>{for_display(d['tbt'])}</td><td>{for_display(d['cls'])}</td><td>{for_display(d['si'])}</td>
         </tr>"""
 
     rows_html = "\n".join(row_html(r) for r in rows)
@@ -182,11 +245,14 @@ def render_image(rows, date_str):
     print(f"Rendered image: {OUTPUT_IMAGE}")
 
 
-def post_clickup_comment(date_str):
+def post_clickup_comment(date_str, failed_tasks):
+    text = f"PageSpeed Report - {date_str}"
+    if failed_tasks:
+        text += f"\n({len(failed_tasks)} check(s) failed after retries and are marked ERR - see GitHub Actions log)"
     resp = requests.post(
         f"https://api.clickup.com/api/v2/task/{CLICKUP_TASK_ID}/comment",
         headers={"Authorization": CLICKUP_API_TOKEN, "Content-Type": "application/json"},
-        json={"comment_text": f"PageSpeed Report - {date_str}", "notify_all": False},
+        json={"comment_text": text, "notify_all": False},
         timeout=30,
     )
     raise_with_body(resp)
@@ -210,10 +276,10 @@ def main():
     urls = load_urls()
     print(f"Running PageSpeed report for {len(urls)} URLs on {date_str}")
 
-    rows = build_rows(urls, date_str)
+    rows, failed_tasks = build_rows(urls, date_str)
     push_to_excel(rows, date_str)
     render_image(rows, date_str)
-    post_clickup_comment(date_str)
+    post_clickup_comment(date_str, failed_tasks)
     upload_clickup_attachment()
 
     print("Done.")
