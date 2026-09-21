@@ -41,6 +41,14 @@ def load_urls():
         return json.load(f)
 
 
+def raise_with_body(resp):
+    """Like resp.raise_for_status(), but prints the response body first so
+    failures are actionable in CI logs instead of a bare 'Bad Request'."""
+    if not resp.ok:
+        print(f"  [http {resp.status_code}] response body: {resp.text[:2000]}")
+        resp.raise_for_status()
+
+
 def fetch_pagespeed(url, strategy, attempts=3):
     api_url = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     params = {"url": url, "strategy": strategy, "key": PAGESPEED_API_KEY}
@@ -48,7 +56,7 @@ def fetch_pagespeed(url, strategy, attempts=3):
     for attempt in range(1, attempts + 1):
         try:
             resp = requests.get(api_url, params=params, timeout=60)
-            resp.raise_for_status()
+            raise_with_body(resp)
             data = resp.json()
             audits = data["lighthouseResult"]["audits"]
             score = data["lighthouseResult"]["categories"]["performance"]["score"]
@@ -103,7 +111,7 @@ def push_to_excel(rows, date_str):
         ]
     }
     resp = requests.post(POWER_AUTOMATE_WEBHOOK_URL, json=payload, timeout=120)
-    resp.raise_for_status()
+    raise_with_body(resp)
     print(f"Excel webhook: {resp.status_code}")
 
 
@@ -181,7 +189,7 @@ def post_clickup_comment(date_str):
         json={"comment_text": f"PageSpeed Report - {date_str}", "notify_all": False},
         timeout=30,
     )
-    resp.raise_for_status()
+    raise_with_body(resp)
     print(f"ClickUp comment posted: {resp.status_code}")
 
 
@@ -193,7 +201,7 @@ def upload_clickup_attachment():
             files={"attachment": ("report.png", f, "image/png")},
             timeout=60,
         )
-    resp.raise_for_status()
+    raise_with_body(resp)
     print(f"ClickUp attachment uploaded: {resp.status_code}")
 
 
