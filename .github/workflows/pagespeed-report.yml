@@ -1,12 +1,12 @@
 name: PageSpeed Report
 
+# 10:00 IST = 04:30 UTC, Mon/Wed/Fri. Adjust the hour if you want a
+# different run time, keep the day list "1,3,5" for Mon/Wed/Fri.
 on:
   schedule:
-    # 09:00 IST = 03:30 UTC, Mon/Wed/Fri. Adjust the hour if you want a
-    # different run time, keep the day list "1,3,5" for Mon/Wed/Fri.
-    - cron: "30 3 * * 1,3,5"
-  workflow_dispatch: {}   # lets you trigger a manual test run from the Actions tab
-
+    - cron: "30 4 * * 1,3,5"
+  workflow_dispatch: {}
+  
 jobs:
   run-report:
     runs-on: ubuntu-latest
