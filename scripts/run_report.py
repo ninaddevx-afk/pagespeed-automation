@@ -36,7 +36,7 @@ POWER_AUTOMATE_WEBHOOK_URL = os.environ["POWER_AUTOMATE_WEBHOOK_URL"]
 
 # How many PageSpeed calls to run at once. PageSpeed's own quota comfortably
 # allows this; raise cautiously if you want it faster still.
-MAX_WORKERS = 5
+MAX_WORKERS = 1
 
 # Adjust to your local timezone for the date shown in the report/comment.
 IST = timezone(timedelta(hours=5, minutes=30))
