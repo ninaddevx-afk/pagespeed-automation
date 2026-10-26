@@ -5,7 +5,8 @@ Run on alternate weekdays via GitHub Actions. Reads config/urls.json, calls the
 PageSpeed Insights API for each URL (mobile + desktop), pushes the rows to
 an Excel table through a Power Automate HTTP-trigger flow, renders a styled
 table image with Playwright, uploads it to a ClickUp task and posts a comment
-that links to the uploaded image.
+containing the image URL (ClickUp shows a preview) plus audit details for every
+page whose score is below SCORE_THRESHOLD (default 60).
 
 Required environment variables:
   PAGESPEED_API_KEY
@@ -14,7 +15,9 @@ Required environment variables:
   POWER_AUTOMATE_WEBHOOK_URL
 
 Optional:
-  MAX_WORKERS   concurrent PageSpeed calls (default 3)
+  MAX_WORKERS       concurrent PageSpeed calls (default 3)
+  SCORE_THRESHOLD   report audit details for scores below this (default 60)
+  MAX_AUDITS        audits listed per URL/device (default 5)
 """
 
 import json
@@ -40,6 +43,13 @@ POWER_AUTOMATE_WEBHOOK_URL = os.environ["POWER_AUTOMATE_WEBHOOK_URL"]
 # How many PageSpeed calls to run at once. Lower to 1 if you hit 429s.
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "3"))
 
+# Pages scoring below this get their failing audits listed in the comment.
+SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "60"))
+MAX_AUDITS = int(os.environ.get("MAX_AUDITS", "5"))
+
+# ClickUp comments have a size limit; stay safely under it.
+MAX_COMMENT_CHARS = 9000
+
 # Adjust to your local timezone for the date shown in the report/comment.
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -64,6 +74,30 @@ def raise_with_body(resp):
         resp.raise_for_status()
 
 
+def extract_issues(data, limit=MAX_AUDITS):
+    """Top failing performance audits, biggest estimated savings first."""
+    audits = data["lighthouseResult"]["audits"]
+    refs = data["lighthouseResult"]["categories"]["performance"]["auditRefs"]
+    issues = []
+    for ref in refs:
+        if ref.get("group") not in ("load-opportunities", "diagnostics"):
+            continue
+        audit = audits.get(ref["id"], {})
+        score = audit.get("score")
+        if score is None or score >= 0.9:
+            continue
+        savings_ms = (audit.get("details") or {}).get("overallSavingsMs", 0) or 0
+        issues.append(
+            {
+                "title": audit.get("title", ref["id"]),
+                "display": audit.get("displayValue", ""),
+                "savings_ms": round(savings_ms),
+            }
+        )
+    issues.sort(key=lambda i: i["savings_ms"], reverse=True)
+    return issues[:limit]
+
+
 def fetch_pagespeed(url, strategy, attempts=3):
     api_url = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     params = {"url": url, "strategy": strategy, "key": PAGESPEED_API_KEY}
@@ -85,6 +119,7 @@ def fetch_pagespeed(url, strategy, attempts=3):
                 "tbt": round(audits["total-blocking-time"]["numericValue"]),
                 "cls": round(audits["cumulative-layout-shift"]["numericValue"], 3),
                 "si": round(audits["speed-index"]["numericValue"] / 1000, 2),
+                "issues": extract_issues(data),
             }
         except Exception as exc:  # noqa: BLE001 - want to retry on any failure
             last_error = exc
@@ -97,7 +132,10 @@ def fetch_pagespeed(url, strategy, attempts=3):
 # None marks a metric that failed after all retries. Formatted per
 # destination: -1 (a value that can't occur naturally) for Excel's numeric
 # columns, "ERR" for the human-readable image.
-ERROR_METRICS = {"score": None, "fcp": None, "lcp": None, "tbt": None, "cls": None, "si": None}
+ERROR_METRICS = {
+    "score": None, "fcp": None, "lcp": None, "tbt": None, "cls": None, "si": None,
+    "issues": [],
+}
 
 
 def for_excel(v):
@@ -245,6 +283,30 @@ def render_image(rows, date_str):
     print(f"Rendered image: {OUTPUT_IMAGE}")
 
 
+def build_improvements(rows):
+    """Audit details for every URL/device whose score is below SCORE_THRESHOLD."""
+    lines = []
+    for r in rows:
+        for label in ("mobile", "desktop"):
+            m = r[label]
+            if m["score"] is None or m["score"] >= SCORE_THRESHOLD:
+                continue
+            lines.append(f"\n{r['url']} - {label.title()} (score {m['score']})")
+            if not m["issues"]:
+                lines.append("  - No audit details available")
+            for i in m["issues"]:
+                extras = []
+                if i["savings_ms"]:
+                    extras.append(f"saves ~{i['savings_ms'] / 1000:.1f}s")
+                if i["display"]:
+                    extras.append(i["display"])
+                suffix = f" ({', '.join(extras)})" if extras else ""
+                lines.append(f"  - {i['title']}{suffix}")
+    if not lines:
+        return ""
+    return f"\n\nAudits to fix (score below {SCORE_THRESHOLD}):" + "\n".join(lines)
+
+
 def upload_clickup_attachment(date_str):
     """Upload report.png to the task. Returns the file URL (or None)."""
     with open(OUTPUT_IMAGE, "rb") as f:
@@ -262,12 +324,16 @@ def upload_clickup_attachment(date_str):
         return None
 
 
-def post_clickup_comment(date_str, failed_tasks, image_url=None):
+def post_clickup_comment(date_str, failed_tasks, image_url=None, improvements=""):
     text = f"PageSpeed Report - {date_str}"
     if image_url:
-        text += f"\n{image_url}"
+        # URL on its own line so ClickUp can unfurl it into an image preview.
+        text += f"\n\n{image_url}"
     if failed_tasks:
-        text += f"\n({len(failed_tasks)} check(s) failed after retries and are marked ERR - see GitHub Actions log)"
+        text += f"\n\n({len(failed_tasks)} check(s) failed after retries and are marked ERR - see GitHub Actions log)"
+    text += improvements
+    if len(text) > MAX_COMMENT_CHARS:
+        text = text[:MAX_COMMENT_CHARS] + "\n... (truncated)"
     resp = requests.post(
         f"https://api.clickup.com/api/v2/task/{CLICKUP_TASK_ID}/comment",
         headers={"Authorization": CLICKUP_API_TOKEN, "Content-Type": "application/json"},
@@ -281,14 +347,17 @@ def post_clickup_comment(date_str, failed_tasks, image_url=None):
 def main():
     date_str = datetime.now(IST).strftime("%d-%b-%Y")
     urls = load_urls()
-    print(f"Running PageSpeed report for {len(urls)} URLs on {date_str} (workers={MAX_WORKERS})")
+    print(
+        f"Running PageSpeed report for {len(urls)} URLs on {date_str} "
+        f"(workers={MAX_WORKERS}, threshold={SCORE_THRESHOLD})"
+    )
 
     rows, failed_tasks = build_rows(urls, date_str)
     push_to_excel(rows, date_str)
     render_image(rows, date_str)
 
-    # Upload first so the comment can link to the image. If the upload fails,
-    # still post the text comment and keep the error visible in the log.
+    # Upload first so the comment can include the image URL. If the upload
+    # fails, still post the text comment and keep the error visible.
     image_url = None
     upload_failed = False
     try:
@@ -297,7 +366,7 @@ def main():
         upload_failed = True
         safe_print(f"[warn] ClickUp attachment upload failed: {exc}")
 
-    post_clickup_comment(date_str, failed_tasks, image_url)
+    post_clickup_comment(date_str, failed_tasks, image_url, build_improvements(rows))
 
     if upload_failed:
         # Fail the workflow run so you get GitHub's failure notification.
